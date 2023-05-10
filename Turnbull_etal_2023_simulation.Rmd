@@ -1,0 +1,1223 @@
+---
+title: ""
+author: ""
+date: ""
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+#knitr::opts_chunk$set(fig.width =  6.5, fig.height = 6)
+#knitr::opts_chunk$set(fig.width =  3.5, fig.height = 6)
+knitr::opts_chunk$set(echo = TRUE)
+
+# Required packages
+require(dplyr) # data wrangling
+require(ggplot2) # plotting
+require(cowplot) # panel arranging
+require(lubridate) # date wrangling
+require(glmmTMB) # modelling
+require(tidyr) # data wrangling (esp. 'gather')
+
+rm(list = ls()) # clear global environment
+theme_set(theme_classic(base_size = 14))
+```
+
+```{r microclimate, echo = FALSE, results = 'hide', warning = FALSE}
+#### Read in microclimate data #################################################
+# Subset data from example loggers at 10, 20 and 30 cm, tidy column headers
+
+# Read logger with a probe at 10 cm depth
+logger_10 <- cbind(read.csv("microclimate/ESW_6_August.csv", header = TRUE), 
+                   depth = 10)
+names(logger_10)[1:3] <- c("id", "date_time", "temp_degC")
+
+# Read logger a probe at 20 cm depth
+logger_20 <- cbind(read.csv("microclimate/ESW_8_August.csv", header = TRUE), 
+                   depth = 20)
+names(logger_20)[1:3] <- c("id", "date_time", "temp_degC")
+
+# Read logger a probe at 30 cm depth
+logger_30 <- cbind(read.csv("microclimate/ESW_2_August.csv", header = TRUE), 
+                   depth = 30)
+names(logger_30)[1:3] <- c("id", "date_time", "temp_degC")
+
+# Combine data from each logger into a single data frame
+# Subset to columns that represent probes at selected depths
+microclim_temp <- rbind(
+ logger_10[,1:4], logger_20[,c(1,2,3,5)], logger_30[,c(1,2,3,5)]
+)
+
+# Format dates
+microclim_temp$date_time <-
+  as.POSIXct(microclim_temp$date_time, format = "%y-%m-%d %H:%M:%S")
+# Glimpse data structure
+microclim_temp <- na.omit(microclim_temp) # Omit 3 NAs at logger-shuttle cxns
+glimpse(microclim_temp) # Check structure
+cat("Columns with NAs:",  # Number of columns that contain any NAs
+  ncol(microclim_temp[sapply(microclim_temp, function(x) any(is.na(x)))]), "\n")
+
+microclim_original <- microclim_temp
+
+#### Reactive microclimate data set ############################################
+# Subset data to user-selected burrowing depth and winter length
+microclim_temp_selected <- reactive({
+  microclim_original[which(
+    microclim_original$depth %in% input$depth &
+    microclim_original$date_time >= as.POSIXct(paste0(
+        as.character(input$start_date), " ", "00:00:01"
+      ), format = "%Y-%m-%d %H:%M:%S") &
+      microclim_original$date_time <= as.POSIXct(paste0(
+        as.character(input$end_date), " ", "00:00:01"
+      ), format = "%Y-%m-%d %H:%M:%S")
+  ), ]
+})
+
+#### Reactive microclimate plot ################################################
+# Plot data for user-selected burrowing depth and winter length
+output$microclimate_plot <- renderPlot({
+  fig1 <- ggplot(data = microclim_temp_selected(),
+                                aes(
+                                  x = date_time,
+                                  y = temp_degC,
+                                  linetype = as.factor(depth),
+                                  color = as.factor(depth)
+                                )) +
+    geom_line() +
+    scale_color_manual(
+      values = c("#D55E00",  "#CC79A7", "#0072B2"),
+      breaks = c("10", "20", "30")
+    ) +
+    scale_linetype_manual(values = c("solid", "solid", "solid"),
+                          breaks = c("10", "20", "30")) +
+    xlab("Date") +
+    ylab("Temperature (°C) ") +
+    xlim(
+      as.POSIXct(paste0(
+        as.character(input$start_date), " ", "00:00:01"
+      ),
+      format = "%Y-%m-%d %H:%M:%S"),
+      as.POSIXct(paste0(
+        as.character(input$end_date), " ", "00:00:01"
+      ),
+      format = "%Y-%m-%d %H:%M:%S")
+    ) +
+    guides(color = guide_legend(title = "Burrowing Depth (cm)",
+                                title.position = "top",  nrow = 1)) +
+    guides(linetype = guide_legend(title = "Burrowing Depth (cm)",
+                                   title.position = "top",  nrow = 1)) +
+    theme(legend.box = "horizontal", legend.position="top")
+  
+  ggdraw() +
+    draw_plot(
+      fig1,
+      x = 0,
+      y = 0,
+      width = 1,
+      height = 1
+    )
+})
+
+```
+
+```{r acclimatization, echo = FALSE, results = 'hide', warning = FALSE}
+#### Read in Field data ########################################################
+# Sort some variable classes, check the data structure, check for NAs. 
+field_data <- read.csv("metabolic rates/field_mr2020.csv", 
+                       stringsAsFactors = FALSE)
+field_data$id <- as.factor(field_data$id) # factor
+field_data$date <- ymd(field_data$time) # date
+glimpse(field_data) # check structure
+cat("Columns with NAs:",  # number of columns that contain any NAs
+  ncol(field_data[sapply(field_data, function(x) any(is.na(x)))]), "\n")
+
+#### Read in Baseline data #####################################################
+# Sort some variable classes, check the data structure, check for NAs. 
+baseline_data <- read.csv("metabolic rates/baseline_mr2020.csv", 
+                          stringsAsFactors = FALSE)
+baseline_data$id <- as.factor(baseline_data$id) # Factor
+glimpse(baseline_data) # Check structure
+cat("Columns with NAs:",  # number of columns that contain any NAs
+  ncol(baseline_data[sapply(baseline_data, function(x) any(is.na(x)))]), "\n")
+
+#### Field model ###############################################################
+field_RI <- glmmTMB(VCO2 ~ wet_mass_mg + time + depth_cm * test_temperature +
+                          (1|id),
+                        family = Gamma(link = "log"), data = field_data)
+
+# N.B. Warning "NA/NAN function evaluation" 
+#
+# From glmmTMB troubleshooting vignette:
+# https://cran.r-project.org/web/packages/glmmTMB/vignettes/troubleshooting.html
+#
+# "This warning occurs when the optimizer visits a region of parameter space that 
+# is invalid. It is not a problem as long as the optimizer has left that region 
+# of parameter space upon convergence, which is indicated by an absence of the
+# model convergence warnings described above."
+
+
+#### Baseline model ############################################################
+baseline_mod <- glmmTMB(VCO2 ~ wet_mass_mg + test_temperature,
+                        family = Gamma(link = "log"), data = baseline_data)
+
+# Subset data to generate predictions curves for each month
+oct_field <- field_data[which(field_data$time =='2015-10-01'),]
+nov_field <- field_data[which(field_data$time =='2015-11-01'),]
+jan_field <- field_data[which(field_data$time =='2016-01-01'),]
+may_field <- field_data[which(field_data$time =='2016-05-01'),]
+
+# Set to overall average mass 
+average_mass_prepupae <- field_data %>%
+  summarize(mean_mass = mean(wet_mass_mg)) %>%
+  dplyr::select(mean_mass) %>%
+  unlist() %>%
+  as.numeric() # set average prepupal mass (i.e. 449 mg)
+
+
+#### Generate prediction curve for baseline data ###############################
+pred_baseline <- data.frame(
+  wet_mass_mg = average_mass_prepupae,
+  test_temperature = seq(5, 25, length.out = 100)
+)
+
+pred_baseline$fit <- predict(baseline_mod, newdata = pred_baseline,
+                            se.fit = FALSE, allow.new.levels = TRUE)
+
+pred_baseline_original <- pred_baseline # create a non-reactive copy
+
+#### Generate predictions for October data #####################################
+pred_oct_field <- data.frame(
+  id = rep(NA, 300),
+  time = rep('2015-10-01',300),
+  wet_mass_mg = average_mass_prepupae,
+    test_temperature = rep(seq(min(oct_field$test_temperature),
+                               max(oct_field$test_temperature),
+                               length.out = 100),3),
+    depth_cm = rep(c(10,20,30), each = 100)
+)
+
+ex_oct_field <- pred_oct_field # create copy for extrapolated predictions
+ex_oct_field$test_temperature <- rep(seq(5, 25, length.out = 100), 3)
+
+# interpolated predictions
+pred_oct_field$fit <- predict(field_RI, newdata = pred_oct_field,
+                            se.fit = FALSE, allow.new.levels = TRUE)
+# extrapolated predictions
+ex_oct_field$fit <- predict(field_RI, newdata = ex_oct_field,
+                            se.fit = FALSE, allow.new.levels = TRUE)
+
+# Generate predictions for November data #######################################
+pred_nov_field <- data.frame(
+  id = rep(NA, 300),
+  time = rep('2015-11-01',300),
+  wet_mass_mg = average_mass_prepupae,
+    test_temperature = rep(seq(min(nov_field$test_temperature),
+                               max(nov_field$test_temperature),
+                               length.out = 100),3),
+    depth_cm = rep(c(10,20,30), each = 100)
+  
+)
+
+ex_nov_field <- pred_nov_field  # create copy for extrapolated predictions
+ex_nov_field$test_temperature <- rep(seq(5, 25, length.out = 100), 3)
+
+# interpolated predictions
+pred_nov_field$fit <- predict(field_RI, newdata = pred_nov_field,
+                            se.fit = FALSE, allow.new.levels = TRUE)
+# extrapolated predictions
+ex_nov_field$fit <- predict(field_RI, newdata = ex_nov_field,
+                            se.fit = FALSE, allow.new.levels = TRUE)
+
+# Generate predictions for January data ########################################
+pred_jan_field <- data.frame(
+  id = rep(NA, 300),
+  time = rep('2016-01-01',300),
+  wet_mass_mg = average_mass_prepupae,
+    test_temperature = rep(seq(min(jan_field$test_temperature),
+                               max(jan_field$test_temperature),
+                               length.out = 100),3),
+    depth_cm = rep(c(10,20,30), each = 100)
+  
+)
+
+ex_jan_field <- pred_jan_field  # create copy for extrapolated predictions
+ex_jan_field$test_temperature <- rep(seq(5, 25, length.out = 100), 3)
+
+# interpolated predictions
+pred_jan_field$fit <- predict(field_RI, newdata = pred_jan_field,
+                            se.fit = FALSE, allow.new.levels = TRUE)
+# extrapolated predictions
+ex_jan_field$fit <- predict(field_RI, newdata = ex_jan_field,
+                            se.fit = FALSE, allow.new.levels = TRUE)
+
+# Generate predictions for May data ############################################
+pred_may_field <- data.frame(
+  id = rep(NA, 300),
+  time = rep('2016-05-01',300),
+  wet_mass_mg = average_mass_prepupae,
+    test_temperature = rep(seq(min(may_field$test_temperature),
+                               max(may_field$test_temperature),
+                               length.out = 100),3),
+    depth_cm = rep(c(10,20,30), each = 100)
+  
+)
+
+ex_may_field <- pred_may_field  # create copy for extrapolated predictions
+ex_may_field$test_temperature <- rep(seq(5, 25, length.out = 100), 3)
+
+# interpolated predictions
+pred_may_field$fit <- predict(field_RI, newdata = pred_may_field,
+                            se.fit = FALSE, allow.new.levels = TRUE)
+# extrapolated predictions
+ex_may_field$fit <- predict(field_RI, newdata = ex_may_field,
+                            se.fit = FALSE, allow.new.levels = TRUE)
+
+#### Reactive metabolic rate-temperature (MR-T) data sets ######################
+MT_oct <- reactive({
+  ex_oct_field[which(ex_oct_field$depth_cm %in% input$curve),]
+})
+
+MT_nov <- reactive({
+  ex_nov_field[which(ex_nov_field$depth_cm %in% input$curve),]
+})
+
+MT_jan <- reactive({
+  ex_jan_field[which(ex_jan_field$depth_cm %in% input$curve),]
+})
+
+MT_may <- reactive({
+  ex_may_field[which(ex_may_field$depth_cm %in% input$curve),]
+})
+
+#### Reactive metabolic rate-temperature (MR-T) curve plot #####################
+output$tMR <- renderPlot({
+
+#### October MR-T plot #########################################################
+  fig2A <- ggplot() +
+    geom_line(
+      aes(
+        x = test_temperature,
+        y = exp(fit) * 60000,
+        linetype = "Baseline",
+        color = "Baseline"
+      ),
+      data = pred_baseline_original
+    ) +
+    geom_line(
+      aes(
+        x = test_temperature,
+        y = exp(fit) * 60000,
+        color = as.factor(depth_cm),
+        linetype = as.factor(depth_cm)
+      ),
+      data = MT_oct()
+    ) +
+    ggtitle("A. October") +
+    ylim(c(0, 100)) +
+    scale_color_manual(
+      name = "Acclimatization Depth (cm)",
+      values = c("#000000", "#000000", "#000000", "#999999"),
+      breaks = c(10, 20, 30, "Baseline"),
+      labels = c("10.0 cm", "20.0 cm", "30.0 cm", "Baseline")
+    ) +
+    scale_linetype_manual(
+      values = c("solid", "dashed", "dotted", "twodash"),
+      name = "Acclimatization Depth (cm)",
+      breaks = c(10, 20, 30, "Baseline"),
+      labels = c("10.0 cm", "20.0 cm", "30.0 cm",
+                 "Baseline")
+    ) +
+    xlab("Temperature (°C)") +
+    ylab(expression(italic(dot("V")) * 'CO'[2] * ' (' * mu * 'L h' ^
+                      -1 * ")")) +
+    theme(plot.title = element_text(face = "bold")) +
+    theme(legend.background = element_rect(fill = alpha("white", 0))) +
+    theme(legend.position = c(.4, .6))
+
+#### November MR-T plot ########################################################
+  fig2B <- ggplot() +
+    geom_line(
+      aes(x = test_temperature, y = exp(fit) * 60000),
+      data = pred_baseline_original,
+      color = "#99999950",
+      linetype = "twodash"
+    ) +
+    geom_line(aes(
+      x = test_temperature,
+      y = exp(fit) * 60000,
+      linetype = as.factor(depth_cm)
+    ),
+    data = MT_nov()) +
+    ggtitle("B. November") +
+    ylim(c(0, 100)) +
+    scale_linetype_manual(
+      values = c("solid",
+                 "dashed", "dotted", "solid"),
+      name = "",
+      breaks = c(10, 20, 30, "baseline"),
+      labels = c("10.0 cm", "20 cm", "30 cm", "Baseline")
+    ) +
+    theme(legend.position = "none") +
+    xlab("Temperature (°C)") +
+    ylab(expression(italic(dot("V")) * 'CO'[2] * ' (' * mu *
+                      'L h' ^ -1 * ")")) +
+    theme(plot.title = element_text(face = "bold"))
+
+#### January MR-T plot #########################################################
+  fig2C <- ggplot() +
+    geom_line(
+      aes(x = test_temperature, y = exp(fit) * 60000),
+      data = pred_baseline_original,
+      color = "#99999950",
+      linetype = "twodash"
+    ) +
+    geom_line(aes(
+      x = test_temperature,
+      y = exp(fit) * 60000,
+      linetype = as.factor(depth_cm)
+    ),
+    data = MT_jan()) +
+    ggtitle("C. January") +
+    ylim(c(0, 100)) +
+    scale_linetype_manual(
+      values = c("solid","dashed", "dotted", "solid"),
+      name = "",
+      breaks = c(10, 20, 30, "baseline"),
+      labels = c("10.0 cm", "20 cm", "30 cm", "Baseline")
+      
+    ) +
+    theme(legend.position = "none") +
+    xlab("Temperature (°C)") +
+    ylab(expression(italic(dot("V")) * 'CO'[2] * ' (' * mu * 'L h' ^
+                      -1 * ")")) +
+    theme(plot.title = element_text(face = "bold")) 
+
+#### May MR-T plot #############################################################
+  fig2D <- ggplot() +
+    geom_line(
+      aes(x = test_temperature, y = exp(fit) * 60000),
+      data = pred_baseline_original,
+      color = "#99999950",
+      linetype = "twodash"
+    ) +
+    geom_line(aes(
+      x = test_temperature,
+      y = exp(fit) * 60000,
+      linetype = as.factor(depth_cm)
+    ),
+    data = MT_may()) +
+    ggtitle("D. May") +
+    ylim(c(0, 100)) +
+    scale_linetype_manual(
+      values =  c("solid", "dashed", "dotted", "solid"),
+      name = "",
+      breaks = c(10, 20, 30, "baseline"),
+      labels = c("10.0 cm", "20 cm", "25.0 cm", "Baseline")
+    ) +
+    theme(legend.position = "none") +
+    xlab("Temperature (°C)") +
+    ylab(expression(italic(dot("V")) * 'CO'[2] * ' (' * mu * 'L h' ^
+                      -1 * ")")) +
+    theme(plot.title = element_text(face = "bold"))
+
+ggdraw() +
+  draw_plot(fig2A, x = 0, y = 0.5, width = 0.5, height = 0.5) +
+  draw_plot(fig2B, x = 0.5, y = 0.5, width = 0.5, height = 0.5) +
+  draw_plot(fig2C, x = 0, y = 0, width = 0.5, height = 0.5) +
+  draw_plot(fig2D, x = 0.5, y = 0, width = 0.5, height = 0.5) 
+
+})
+
+```
+
+```{r lipid use, echo = FALSE, results = 'hide', warning = FALSE}
+#### Set MR-T seasonal bounds ##################################################
+sep_bd <- as.POSIXct("15-09-01 00:00:01", format = "%y-%m-%d %H:%M:%S")
+oct_bd <- as.POSIXct("15-10-01 00:00:01", format = "%y-%m-%d %H:%M:%S")
+nov_bd <- as.POSIXct("15-11-01 00:00:01", format = "%y-%m-%d %H:%M:%S")
+jan_bd <- as.POSIXct("16-01-01 00:00:01", format = "%y-%m-%d %H:%M:%S")
+may_bd <- as.POSIXct("16-05-01 00:00:01", format = "%y-%m-%d %H:%M:%S")
+jun_bd <- as.POSIXct("16-06-01 00:00:01", format = "%y-%m-%d %H:%M:%S")
+
+microclim_temp$time <- NA
+microclim_temp$time <- ifelse(
+                              microclim_temp$date_time < oct_bd,
+                              "2015-09-01",
+                              microclim_temp$time)
+microclim_temp$time <- ifelse(microclim_temp$date_time >= oct_bd &
+                              microclim_temp$date_time < nov_bd,
+                              "2015-10-01", 
+                              microclim_temp$time)
+microclim_temp$time <- ifelse(microclim_temp$date_time >= nov_bd &
+                              microclim_temp$date_time < jan_bd,
+                              "2015-11-01", 
+                              microclim_temp$time)
+microclim_temp$time <- ifelse(microclim_temp$date_time >= jan_bd &
+                              microclim_temp$date_time < may_bd,
+                              "2016-01-01", 
+                              microclim_temp$time)
+microclim_temp$time <- ifelse(microclim_temp$date_time >= may_bd, 
+                              "2016-05-01", 
+                              microclim_temp$time)
+
+# Generate September to October (baseline) predictions #########################
+# "Pre-acclimatization" period
+microclim_temp$id <- NA # set NA for individual id in predictions
+microclim_temp$mass <- field_data %>%
+  summarize(mean_mass = mean(wet_mass_mg)) %>%
+  dplyr::select(mean_mass) %>%
+  unlist() %>%
+  as.numeric() # set average prepupal mass (i.e. 449 mg)
+
+pred_baseline <- data.frame(
+  date_time = microclim_temp$date_time,
+  acclimatization_depth = 0,
+  burrowing_depth = microclim_temp$depth,
+  id = microclim_temp$id,
+  time = microclim_temp$time,
+  wet_mass_mg = microclim_temp$mass,
+  test_temperature = microclim_temp$temp_degC,
+  depth_cm = 0,
+  soil_depth = microclim_temp$depth
+)
+
+pred_baseline$fit <- predict(baseline_mod, newdata = pred_baseline,
+                            se.fit = FALSE, allow.new.levels = TRUE)
+pred_baseline <- pred_baseline[which(pred_baseline$time == "2015-09-01"),]
+
+# Generate October to end of dormancy predictions ##############################
+# "Post-acclimatization" period
+microclim_temp <- microclim_temp[which(microclim_temp$time != "2015-09-01"),]
+
+#### 30 cm acclimatization predictions #########################################
+predictions_30 <- data.frame(
+  date_time = microclim_temp$date_time,
+  acclimatization_depth = 30,
+  burrowing_depth = microclim_temp$depth,
+  id = microclim_temp$id,
+  time = microclim_temp$time,
+  wet_mass_mg = microclim_temp$mass,
+  test_temperature = microclim_temp$temp_degC,
+  depth_cm = 30,
+  soil_depth = microclim_temp$depth
+)
+
+predictions_30 <- predictions_30[which(!is.na(predictions_30$time)),]
+predictions_30$fit <- predict(field_RI, newdata = predictions_30,
+                            se.fit = FALSE, allow.new.levels = TRUE)
+pred_baseline$acclimatization_depth <- 30
+predictions_30 <- rbind(pred_baseline, predictions_30) # Append Sep. predictions
+predictions_30$fit <- exp(predictions_30$fit)*60000 # uL/h VCO2
+
+#### 20 cm acclimatization predictions #########################################
+predictions_20 <- data.frame(
+  date_time = microclim_temp$date_time,
+  acclimatization_depth = 20,
+  burrowing_depth = microclim_temp$depth,
+  id = microclim_temp$id,
+  time = microclim_temp$time,
+  wet_mass_mg = microclim_temp$mass,
+  test_temperature = microclim_temp$temp_degC,
+  depth_cm = 20,
+  soil_depth = microclim_temp$depth
+)
+
+predictions_20 <- predictions_20[which(!is.na(predictions_20$time)),]
+predictions_20$fit <- predict(field_RI, newdata = predictions_20,
+                            se.fit = FALSE, allow.new.levels = TRUE)
+pred_baseline$acclimatization_depth <- 20
+predictions_20 <- rbind(pred_baseline, predictions_20) # Append Sep. predictions
+predictions_20$fit <- exp(predictions_20$fit)*60000 # uL/h VCO2
+
+#### 10 cm acclimatization predictions #########################################
+predictions_10 <- data.frame(
+  date_time = microclim_temp$date_time,
+  acclimatization_depth = 10,
+  burrowing_depth = microclim_temp$depth,
+  id = microclim_temp$id,
+  time = microclim_temp$time,
+  wet_mass_mg = microclim_temp$mass,
+  test_temperature = microclim_temp$temp_degC,
+  depth_cm = 10,
+  soil_depth = microclim_temp$depth
+)
+
+predictions_10 <- predictions_10[which(!is.na(predictions_10$time)),]
+predictions_10$fit <- predict(field_RI, newdata = predictions_10,
+                            se.fit = FALSE, allow.new.levels = TRUE)
+pred_baseline$acclimatization_depth <- 10
+predictions_10 <- rbind(pred_baseline, predictions_10) # Append Sep. predictions
+predictions_10$fit <- exp(predictions_10$fit)*60000 # uL/h VCO2
+
+#### Reactive hourly VCO2 predictions ##########################################
+predictions <- rbind(predictions_10, predictions_20, predictions_30) # collate
+VCO2_hourly  <- reactive({
+  predictions[which(
+    predictions$acclimatization_depth %in% input$curve &
+    predictions$burrowing_depth %in% input$depth &
+    predictions$date_time >= as.POSIXct(paste0(
+        as.character(input$start_date), " ", "00:00:01"
+      ), format = "%Y-%m-%d %H:%M:%S") &
+    predictions$date_time <= as.POSIXct(paste0(
+        as.character(input$end_date), " ", "00:00:01"
+      ), format = "%Y-%m-%d %H:%M:%S")
+  ), ]
+})
+
+#### Reactive cumulative lipid predictions #####################################
+lipid_g_cum  <- reactive({
+  temp_pred <-
+    predictions[which(
+      predictions$acclimatization_depth %in% input$curve &
+        predictions$burrowing_depth %in% input$depth &
+        predictions$date_time >= as.POSIXct(paste0(
+          as.character(input$start_date), " ", "00:00:01"
+        ), format = "%Y-%m-%d %H:%M:%S") &
+        predictions$date_time <= as.POSIXct(paste0(
+          as.character(input$end_date), " ", "00:00:01"
+        ), format = "%Y-%m-%d %H:%M:%S")
+    ), ]
+   # to g/h of fat (from uL/h CO2) assuming an RQ of 0.7 (predominately lipid),
+   # and that 2 L of O2 is consumed per gram of lipid used; see manuscript for 
+   # details
+  temp_pred$lipid_g <-
+    temp_pred$fit / 1000000 / 0.7 / 2
+  temp_pred$cum_lipid <- ave( # cumulative lipid curves
+    temp_pred$lipid_g,
+    temp_pred$acclimatization_depth,
+    temp_pred$burrowing_depth,
+    FUN = cumsum
+  ) 
+  temp_pred
+})
+
+#### Reactive seasonal summary data ############################################
+
+
+# Calculate cumulative lipid use in autumn; ending on 2015-12-01
+autumn_sum <- reactive({
+  autumn_seas <- lipid_g_cum()
+  autumn_seas <- autumn_seas[which(
+      autumn_seas$date_time  > input$start_date &
+      autumn_seas$date_time  < as.POSIXct("2015-12-01", format = "%Y-%m-%d")
+  ),]
+  autumn_seas$cum_lipid <- ave(
+    autumn_seas$lipid_g,
+    autumn_seas$acclimatization_depth,
+    autumn_seas$burrowing_depth,
+    FUN = cumsum
+  ) # cumulative lipid to first hour of 2015-12-01
+  autumn_seas$cum_lipid <- ave(
+    autumn_seas$cum_lipid,
+    autumn_seas$acclimatization_depth,
+    autumn_seas$burrowing_depth,
+    FUN = max
+  ) # cumulative lipid on first hour of 2015-12-01
+ autumn_seas <- distinct(autumn_seas, cum_lipid, .keep_all = TRUE)
+  autumn_seas
+})
+
+# Calculate cumulative lipid use in winter; ending on 2016-03-01
+winter_sum <- reactive({
+  winter_seas <- lipid_g_cum()
+  winter_seas <- winter_seas[which(
+    winter_seas$date_time  > as.POSIXct("2015-12-01", format = "%Y-%m-%d") &
+    winter_seas$date_time  < as.POSIXct("2016-03-01", format = "%Y-%m-%d")
+  ), ]
+  winter_seas$cum_lipid <- ave(
+    winter_seas$lipid_g,
+    winter_seas$acclimatization_depth,
+    winter_seas$burrowing_depth,
+    FUN = cumsum
+  ) # cumulative lipid on last hour of 2016-03-01
+    winter_seas$cum_lipid <- ave(
+    winter_seas$cum_lipid,
+    winter_seas$acclimatization_depth,
+    winter_seas$burrowing_depth,
+    FUN = max
+  ) # cumulative lipid on last hour of 2016-03-01
+  winter_seas <- distinct(winter_seas, cum_lipid, .keep_all = TRUE)
+  winter_seas
+})
+
+# Calculate cumulative lipid use in winter; ending on 2016-06-01
+spring_sum <- reactive({
+  spring_seas <- lipid_g_cum()
+  spring_seas <- spring_seas[which(
+    spring_seas$date_time  > as.POSIXct("2016-03-01", format = "%Y-%m-%d") &
+    spring_seas$date_time  < as.POSIXct("2016-06-01", format = "%Y-%m-%d")
+  ),]
+  spring_seas$cum_lipid <- ave(
+    spring_seas$lipid_g,
+    spring_seas$acclimatization_depth,
+    spring_seas$burrowing_depth,
+    FUN = cumsum
+  ) # cumulative lipid on last hour of 2016-06-01
+  spring_seas$cum_lipid <- ave(
+    spring_seas$cum_lipid,
+    spring_seas$acclimatization_depth,
+    spring_seas$burrowing_depth,
+    FUN = max
+  ) # cumulative lipid on last hour of 2016-06-01
+  spring_seas <- distinct(spring_seas, cum_lipid, .keep_all = TRUE)
+  spring_seas
+  
+})
+
+#### Reactive cumulative lipid plot ############################################
+
+output$lipid_by_hour <- renderPlot({
+  fig3A <- ggplot(
+    data = VCO2_hourly(),
+    aes(
+      x = date_time,
+      y = fit / 1000000 / 0.7 / 2 * 1000 * 1000,
+   # to ug/h of fat (from uL/h CO2) assuming an RQ of 0.7 (predominately lipid),
+   # and that 2 L of O2 is consumed per gram of lipid used; see manuscript for 
+   # details
+      linetype = as.factor(acclimatization_depth),
+      color = as.factor(burrowing_depth)
+    )
+  ) +
+    geom_line() +
+    scale_color_manual(
+      values = c("#0072B2", "#CC79A7", "#D55E00"),
+      breaks = c("30", "20", "10")
+    ) +
+    scale_linetype_manual(
+      values = c("solid",
+                 "dashed", "dotted"),
+      breaks = c("10", "20", "30")
+    ) +
+    xlab("Date") +
+    ggtitle("A. Hourly lipid use") +
+    ylab(expression('Lipid use (' * mu * 'g h' ^ -1 * ")")) +
+    xlim(
+      as.POSIXct(paste0(
+        as.character(input$start_date), " ", "00:00:01"
+      ),
+      format = "%Y-%m-%d %H:%M:%S"),
+      as.POSIXct(paste0(
+        as.character(input$end_date), " ", "00:00:01"
+      ),
+      format = "%Y-%m-%d %H:%M:%S")
+    ) +
+    guides(color = guide_legend(title = "Burrowing Depth (cm)")) +
+    guides(linetype = guide_legend(title = "Acclimatization Depth (cm)")) +
+    guides(color = guide_legend(title = "Burrowing Depth (cm)",
+                                title.position = "top",  nrow = 1)) +
+    guides(linetype = guide_legend(title = "Acclimatization Depth (cm)",
+                                title.position = "top",  nrow = 1)) +
+    theme(legend.box = "horizontal", legend.position=c(0.65, 1)) +
+        theme(plot.title = element_text(face = "bold"),
+             legend.background = element_rect(fill = "transparent", colour = NA),
+             legend.box.background = element_rect(fill = "transparent", colour = NA)
+              ) +
+    geom_vline(xintercept= as.POSIXct("2015-12-01", format = "%Y-%m-%d"),linetype=3)+
+    geom_vline(xintercept= as.POSIXct("2016-03-01", format = "%Y-%m-%d"),linetype=3)
+    
+fig3B <- ggplot(
+    data = lipid_g_cum(),
+    aes(
+      x = date_time,
+      y = cum_lipid * 1000, # in mg
+      linetype = as.factor(acclimatization_depth),
+      color = as.factor(burrowing_depth)
+    )
+  ) +
+    geom_line() +
+    scale_color_manual(
+      values = c("#0072B2", "#CC79A7", "#D55E00"),
+      breaks = c("30", "20", "10")
+    ) +
+    scale_linetype_manual(
+      values = c("solid",
+                 "dashed", "dotted"),
+      breaks = c("10", "20", "30")
+    ) +
+    xlab("Date") +
+    ggtitle("B. Cumulative lipid use") +
+    ylab("Cumulative lipid use (mg)") +
+    xlim(
+      as.POSIXct(paste0(
+        as.character(input$start_date), " ", "00:00:01"
+      ),
+      format = "%Y-%m-%d %H:%M:%S"),
+      as.POSIXct(paste0(
+        as.character(input$end_date), " ", "00:00:01"
+      ),
+      format = "%Y-%m-%d %H:%M:%S")
+    ) +
+        theme(legend.position = "none") +
+      theme(plot.title = element_text(face = "bold")) +
+    geom_vline(xintercept= as.POSIXct("2015-12-01", format = "%Y-%m-%d"),linetype=3)+
+    geom_vline(xintercept= as.POSIXct("2016-03-01", format = "%Y-%m-%d"),linetype=3)
+
+fig3C <- ggplot() + 
+    geom_line(data = autumn_sum(),
+               aes(y = cum_lipid*1000,
+                   x = acclimatization_depth,
+                   group = as.factor(burrowing_depth),
+                   color = as.factor(burrowing_depth)
+                   )) +
+      geom_point(data = autumn_sum(),
+               aes(y = cum_lipid*1000,
+                   x = acclimatization_depth,
+                   group = as.factor(burrowing_depth),
+                   color = as.factor(burrowing_depth)
+                   )) +
+      scale_color_manual(
+      values = c("#0072B2", "#CC79A7", "#D55E00"),
+      breaks = c("30", "20", "10"),
+      guide = F
+    ) +
+    ggtitle("C. Autumn") +
+    ylab("Lipid use (mg)") +
+    xlab("Acclimatization Depth (cm)") +
+   theme(plot.title = element_text(face = "bold")) +
+   scale_x_continuous(breaks=seq(10, 30, 10)) +
+  theme(axis.title = element_text(size = 12))
+  
+fig3D <- ggplot() + 
+    geom_line(data = winter_sum(),
+               aes(y = cum_lipid*1000,
+                   x = acclimatization_depth,
+                   group = as.factor(burrowing_depth),
+                   color = as.factor(burrowing_depth)
+                   )) +
+     geom_point(data = winter_sum(),
+               aes(y = cum_lipid*1000,
+                   x = acclimatization_depth,
+                   group = as.factor(burrowing_depth),
+                   color = as.factor(burrowing_depth)
+                   )) +
+      scale_color_manual(
+      values = c("#0072B2", "#CC79A7", "#D55E00"),
+      breaks = c("30", "20", "10"),
+      guide = F
+    ) +
+    ggtitle("D. Winter") +
+    ylab("Lipid use (mg)") +
+    xlab("Acclimatization Depth (cm)") +
+   theme(plot.title = element_text(face = "bold")) +
+     scale_x_continuous(breaks=seq(10, 30, 10)) +
+    theme(axis.title = element_text(size = 12))
+
+fig3E <- ggplot() + 
+    geom_line(data = spring_sum(),
+               aes(y = cum_lipid*1000,
+                   x = acclimatization_depth,
+                   group = as.factor(burrowing_depth),
+                   color = as.factor(burrowing_depth)
+                   )) +
+     geom_point(data = spring_sum(),
+               aes(y = cum_lipid*1000,
+                   x = acclimatization_depth,
+                   group = as.factor(burrowing_depth),
+                   color = as.factor(burrowing_depth)
+                   )) +
+      scale_color_manual(
+      values = c("#0072B2", "#CC79A7", "#D55E00"),
+      breaks = c("30", "20", "10"),
+      guide = F
+    ) +
+    ggtitle("E. Spring") +
+    ylab("Lipid use (mg)") +
+    xlab("Acclimatization Depth (cm)") +
+   theme(plot.title = element_text(face = "bold")) +
+     scale_x_continuous(breaks=seq(10, 30, 10)) +
+    theme(axis.title = element_text(size = 12))
+
+
+
+ggdraw() +
+  draw_plot(
+    plot_grid(fig3A, fig3B, ncol = 1, align = "v"), # align x-axes 
+    x = 0, y = 0.33, width = 1, height = 0.66
+  ) +
+  draw_plot(fig3C, x = 0, y = 0, width = 0.33, height = 0.33) + 
+  draw_plot(fig3D, x = 0.33, y = 0, width = 0.33, height = 0.33) + 
+  draw_plot(fig3E, x = 0.66, y = 0, width = 0.33, height = 0.33) 
+
+})
+
+```
+
+```{r Validation, echo = FALSE, results = 'hide', warning = FALSE}
+#### Read in empirical lipid data from field-retrieved prepupae ################
+field_data <- read.csv("body_composition/field_body2020.csv", header = TRUE) # read in field data
+field_data$date <- as.POSIXct(field_data$time, format="%Y-%m-%d") # dates with POSIXct
+field_data <- na.omit(field_data)
+
+glimpse(field_data) # data structure is tidy
+cat("Columns with NAs:",  # number of columns that contain any NAs
+  ncol(field_data[sapply(field_data, function(x) any(is.na(x)))]), "\n")
+
+# Assuming initial lipid content in September
+field_data %>%
+  group_by(time) %>%
+  summarize(quants = quantile(lipid, c(.90)))
+  # 90th percentile in October 72.7 
+
+
+#### Reactive simulated lipid use validation data ##############################
+validation_sim_data  <- reactive({
+  cumulative_lipid <- lipid_g_cum() # make a copy of simulated lipid use
+  
+  # Subset simulated lipid use to match the day of empirical data
+  oct_tp <- cumulative_lipid[which(cumulative_lipid$time == "2015-10-01"),]
+  nov_tp <- cumulative_lipid[which(cumulative_lipid$time == "2015-11-01"),]
+  jan_tp <- cumulative_lipid[which(cumulative_lipid$time == "2016-01-01"),]
+  may_tp <- cumulative_lipid[which(cumulative_lipid$time == "2016-05-01"),]
+ 
+  cumulative_lipid <- rbind(oct_tp, nov_tp, jan_tp, may_tp) # collate
+  # Determine the minimum (i.e. at the first hour) cumulative lipid at each 
+  # selected time point, for each acclimatization and burrowing depth
+  cumulative_lipid$cum_lipid <- ave(cumulative_lipid$cum_lipid,
+                             cumulative_lipid$time,
+                             cumulative_lipid$acclimatization_depth,
+                             cumulative_lipid$burrowing_depth, FUN=min)
+   cumulative_lipid <- distinct(cumulative_lipid, cum_lipid, .keep_all = TRUE)
+   cumulative_lipid
+  
+})
+
+#### Absolute error ############################################################
+abs_error_data  <- reactive({
+  pred_sim <- validation_sim_data() # simulation predictions
+  field_ae <- field_data
+  
+  # 10 cm acc, 10 cm burrowing
+  pred_10a10b <- pred_sim[which(pred_sim$acclimatization_depth == 10 &
+                                pred_sim$burrowing_depth == 10),]
+  field_ae$pred_10a10b <- pred_10a10b$cum_lipid[match(as.character(field_ae$time), 
+                                                      as.character(pred_10a10b$time))]
+  
+  # 10 cm acc, 20 cm burrowing
+  pred_10a20b <- pred_sim[which(pred_sim$acclimatization_depth == 10 &
+                                pred_sim$burrowing_depth == 20),]
+  field_ae$pred_10a20b <- pred_10a20b$cum_lipid[match(as.character(field_ae$time), 
+                                                      as.character(pred_10a20b$time))]
+  
+  # 10 cm acc, 30 cm burrowing
+  pred_10a30b <- pred_sim[which(pred_sim$acclimatization_depth == 10 &
+                                pred_sim$burrowing_depth == 30),]
+  field_ae$pred_10a30b <- pred_10a30b$cum_lipid[match(as.character(field_ae$time), 
+                                                      as.character(pred_10a30b$time))]
+ 
+  
+   # 20 cm acc, 10 cm burrowing
+  pred_20a10b <- pred_sim[which(pred_sim$acclimatization_depth == 20 &
+                                pred_sim$burrowing_depth == 10),]
+  field_ae$pred_20a10b <- pred_20a10b$cum_lipid[match(as.character(field_ae$time), 
+                                                      as.character(pred_20a10b$time))]
+  
+  # 20 cm acc, 20 cm burrowing
+  pred_20a20b <- pred_sim[which(pred_sim$acclimatization_depth == 20 &
+                                pred_sim$burrowing_depth == 20),]
+  field_ae$pred_20a20b <- pred_20a20b$cum_lipid[match(as.character(field_ae$time), 
+                                                      as.character(pred_20a20b$time))]
+  
+  # 20 cm acc, 30 cm burrowing
+  pred_20a30b <- pred_sim[which(pred_sim$acclimatization_depth == 20 &
+                                pred_sim$burrowing_depth == 30),]
+  field_ae$pred_20a30b <- pred_20a30b$cum_lipid[match(as.character(field_ae$time), 
+                                                      as.character(pred_20a30b$time))]
+  
+   # 30 cm acc, 10 cm burrowing
+  pred_30a10b <- pred_sim[which(pred_sim$acclimatization_depth == 30 &
+                                pred_sim$burrowing_depth == 10),]
+  field_ae$pred_30a10b <- pred_30a10b$cum_lipid[match(as.character(field_ae$time), 
+                                                      as.character(pred_30a10b$time))]
+  
+  # 30 cm acc, 20 cm burrowing
+  pred_30a20b <- pred_sim[which(pred_sim$acclimatization_depth == 30 &
+                                pred_sim$burrowing_depth == 20),]
+  field_ae$pred_30a20b <- pred_30a20b$cum_lipid[match(as.character(field_ae$time), 
+                                                      as.character(pred_30a20b$time))]
+  
+  # 30 cm acc, 30 cm burrowing
+  pred_30a30b <- pred_sim[which(pred_sim$acclimatization_depth == 30 &
+                                pred_sim$burrowing_depth == 30),]
+  field_ae$pred_30a30b <- pred_30a30b$cum_lipid[match(as.character(field_ae$time), 
+                                                      as.character(pred_30a30b$time))]
+  field_ae <- gather(field_ae, curve, pred_lipids, 
+                          pred_10a10b, pred_10a20b, pred_10a30b, 
+                          pred_20a10b, pred_20a20b, pred_20a30b, 
+                          pred_30a10b, pred_30a20b, pred_30a30b)
+  
+  field_ae$ae_acc <- as.numeric(substr(field_ae$curve,6,7))
+  field_ae$ae_burr <- as.numeric(substr(field_ae$curve,9,10))
+  
+  field_ae$absolute_error <- abs(field_ae$lipid - (input$lipid_slider - (field_ae$pred_lipids * 1000)))
+  field_ae <- field_ae[which(!is.na(field_ae$absolute_error)),]
+  field_ae
+})
+
+
+
+#### Validation LM #############################################################
+
+output$ae_anova <- renderPrint({
+  my_dat <- abs_error_data()
+  ae_model <- aov(my_dat$absolute_error ~ my_dat$time + my_dat$ae_burr + my_dat$ae_acc,
+                    data = my_dat)
+  print(ae_model)
+  print(summary(ae_model))
+  print(winter_sum())
+    print(autumn_sum())
+  
+})
+
+
+
+#### Validation plot ###########################################################
+output$validation_plot <- renderPlot({
+  fig4A <- ggplot(field_data, aes(x = time, y = lipid)) +
+    geom_boxplot(aes(), outlier.shape = NA) +
+    geom_jitter(
+      aes(x = time),
+      pch = 21,
+      width = 0.1,
+      size = 2
+    ) +
+    geom_line(
+      data = validation_sim_data(),
+      aes(
+        x = time,
+        y = input$lipid_slider - (cum_lipid * 1000), # mg lipid
+        group = interaction(acclimatization_depth, burrowing_depth),
+        linetype = as.factor(acclimatization_depth),
+        color = as.factor(burrowing_depth)
+      )
+    ) +
+    ylim(0, 100) +
+    labs(y = expression("Lipids (mg)"), x = "Time of year") +
+    scale_color_manual(
+      values = c("#0072B2", "#CC79A7", "#D55E00"),
+      breaks = c("30", "20", "10")
+    ) +
+    scale_linetype_manual(
+      values = c("solid",
+                 "dashed", "dotted"),
+      breaks = c("10", "20", "30")
+    ) +
+    scale_x_discrete(
+      labels = c('Oct', 'Nov', 'Jan', "May"),
+      limits = c("2015-10-01", "2015-11-01", "2016-01-01", "2016-05-01")
+    ) +
+    ggtitle("A. Lipid remaining") +
+    theme(plot.title = element_text(face = "bold")) +
+    geom_text(
+      data = field_data %>%
+        group_by(time) %>%
+        summarize(n = length(lipid),
+                  max_n = max(lipid)),
+      aes(
+        x = time,
+        y = max_n,
+        label = paste0(n, "\n")
+      ),
+      vjust = 0,
+      size = 4
+    ) +
+    guides(color = guide_legend(title = "Burrowing Depth (cm)", order = 1,
+                                verride.aes = list(size = 1))) +
+    guides(linetype = guide_legend(title = "Acclimatization Depth (cm)",
+                                   order = 2,
+                                   override.aes = list(size = 1))) +
+     theme(legend.title=element_text(size=10),
+          legend.text = element_text(size = 8))
+
+
+  
+
+  
+  fig4B <- ggplot(data = abs_error_data(), aes(x = time, y = absolute_error)) +
+           geom_boxplot(aes(fill = as.factor(ae_burr), linetype = as.factor(ae_acc)), outlier.shape = NA) +
+           ggtitle("B. Absolute error") +
+     labs(y = expression("Absolute error (mg)"), x = "Time of year") +
+      theme(plot.title = element_text(face = "bold")) +
+    scale_fill_manual(
+      values = c("#0072B2", "#CC79A7", "#D55E00"),
+      breaks = c("30", "20", "10")
+    ) +
+    scale_linetype_manual(
+      values = c("solid",
+                 "dashed", "dotted"),
+      breaks = c("10", "20", "30")
+    ) +
+    scale_x_discrete(
+      labels = c('Oct', 'Nov', 'Jan', "May"),
+      limits = c("2015-10-01", "2015-11-01", "2016-01-01", "2016-05-01")
+    ) + 
+    guides(fill = guide_legend(title = "Burrowing Depth (cm)", order = 1,
+                                verride.aes = list(size = 1))) +
+    guides(linetype = guide_legend(title = "Acclimatization Depth (cm)",
+                                   order = 2,
+                                   override.aes = list(size = 1))) +
+     theme(legend.title=element_text(size=10),
+          legend.text = element_text(size = 8))
+  
+
+  
+
+  
+plot_grid(fig4A, fig4B, ncol = 1, align = "v")
+
+})
+
+```
+
+
+```{r eruptions, echo=FALSE}
+fluidPage(
+  # App title ----
+  br(),
+  br(),
+  br(),
+textOutput("huh2"),
+  # Sidebar layout with input and output definitions ----
+  sidebarLayout(
+    # Sidebar panel for inputs ----
+    sidebarPanel(
+#### Microclimate input ########################################################
+      checkboxGroupInput("depth", label =  p(icon("ruler-vertical"), 
+                                             "Burrowing Depth"),
+        choiceNames = list(
+          HTML("<font color='#d55e00'>— 10 cm </font>"),
+          HTML("<font color='#cc79a7'>— 20 cm</font>"),
+          HTML("<font color='#0072b2'>— 30 cm</font>")
+        ),
+        choiceValues = list(10, 20, 30),
+        selected = list(10, 30)),
+        
+#### Length of winter input ####################################################
+      hr(),
+p(icon("calendar"), "Dormancy Duration"),
+HTML("<small>Start:</small>"),
+      dateInput("start_date", label = NULL,
+                      value = "2015-09-01",
+                     min = "2015-08-01", max = "2015-11-01"),
+HTML("<small>End:</small>"),
+    dateInput("end_date", label = NULL,
+                      value = "2016-06-01",
+                     min = "2016-04-01", max = "2016-07-01"),
+      hr(),
+#### Metabolic rate ~ temeprature input ########################################
+      checkboxGroupInput("curve", label =  p(icon("ruler-vertical"), 
+                                             "Acclimatization Depth"),
+        choiceNames = list("— 10 cm", 
+                       "-- 20 cm",
+                      "··· 30 cm"),
+        choiceValues = list(10, 20, 30),
+        selected = list(10, 30)), 
+### Select depths below the surface to overwinter ##############################
+      
+
+
+hr(),
+### Select depths below the surface to overwinter ##############################
+     sliderInput("lipid_slider", label = p(icon("battery-full"), "Initial lipid (mg)"), min = 0, 
+        max = 100, value = 73),
+
+hr(),
+  p(icon("github"), HTML("<a href='https://github.com/kurtisturnbull/WBCsimulation'>R script on GitHub</a>")),
+  p(icon("file"), HTML("<a href='https://github.com/kurtisturnbull/WBCsimulation'>Read manuscript</a>")),
+ p(icon("file-csv"), HTML("<a href='https://figshare.com/articles/dataset/Data_from_Burrowing_depth_mediates_the_extent_of_metabolic_suppression_in_a_soil-overwintering_insect_/20491026/1'>Access supporting data</a>"))
+      # br() element to introduce extra vertical spacing ----
+
+
+      # Input: Slider for the number of observations to generate ----
+   
+
+
+
+    ),
+
+    # Main panel for displaying outputs ----
+    mainPanel(
+      tabsetPanel(type = "tabs",
+        tabPanel(
+          p(icon("info-circle", verify_fa = FALSE)), 
+          h4("Interactive winter energy use simulation for 'Burrowing depth mediates the extent of metabolic suppression in a soil-overwintering insect"),
+          h5("Kurtis F. Turnbull, Jeremy N. McNeil, and Brent J. Sinclair"),
+          hr(),
+          h5("Simulation description"),
+          HTML("We used <i>V</i>CO<sub>2</sub>-temperature relationships from empirical respirometry data (described in main manuscript) to predict hourly CO<sub>2</sub> production for simulated prepupae acclimatized to the microclimate of three burrowing depths (i.e. 10, 20, or 30 cm). Briefly, we assumed a maximum dormancy duration of 1 August to 1 July in our simulation. We assumed prepupae were intially ‘unacclimiatized’ and used the <i>V</i>CO<sub>2</sub>-temperature relationship of newly-formed prepupae (i.e. baseline; described in main manuscript) from the start of dormancy to 1 October. Thereafter we used October, November, January, and May <i>V</i>CO<sub>2</sub>-temperature relationships for prepupae acclimatized at microclimates at either 10 or 30 cm (beginning on the first day of each of these months) to predict hourly CO<sub>2</sub> production. Because body mass did not have an significant effect on <i>V</i>CO2 among field prepupae, we assumed the prepupae in our simulation were the overall average mass of those retrieved from the field (i.e. calculated from empirical body mass data; described in main manuscript). Using each of these <i>V</i>CO<sub>2</sub>-temperature relationships, we then predicted hourly CO<sub>2</sub> production at three soil depths (i.e. 10, 20, or 30 cm below the surface) from empirical microclimate data we collected at our field site near Ilderton, Ontario from 1 August 2015 to 1 July 2016 (described in main mauscript). We calculated hourly O<sub>2</sub> consumption from hourly CO<sub>2</sub> production by assuming a respiratory quotient of 0.7 (i.e. lipid as fuel) because we detected a decline in lipids during dormancy in field prepupae (see main manuscript). We then calculated cumulative and hourly lipid consumption by assuming 2 L of O<sub>2</sub> per gram of lipid."
+ ),
+ h5("Initial assumptions"),
+ HTML("Our intial assumptions, and those presented in the main manuscript, are: a dormancy duration from 1 September to 1 June, two burrowing and two acclimatization depths at 10 and 30 cm, and an initial lipid conent of 73 mg. Each of these assumptions can be adjusted using the input panel to the left."),
+h5("Simulation validation"),
+ HTML("We validated our simulation against our empirical lipid content data by first estimating lipid remaining in our simulation by assuming an initial lipid content of 73 mg on 1 September (i.e. the upper 90<sup>th</sup> percental of lipid content in October), and subtracting the simulated amount of lipid consumed at each time point. We calculated the absolute error (i.e. absolute difference between simulated and individual empirical lipid content data) in October, November, January, and May for each simulated acclimatization <i>V</i>CO<sub>2</sub>-temperature relationship."),
+hr(),
+h5(icon("info-circle", verify_fa = FALSE),"Use the tab panels above to view plots of the simulation output"),
+hr()
+        ),
+ 
+ 
+ #### Microclimate plot panel ##################################################
+ tabPanel(
+   p(icon("sun-plant-wilt"), "Microclimate"),
+   br(),
+   p(
+     icon("info-circle", verify_fa = FALSE),
+     "Use the panel to select burrowing depth(s) and dormancy duration."
+   ),
+   hr(),
+   plotOutput("microclimate_plot", height = "500px"),
+   br(),
+   p(
+     strong(
+       "Hourly soil temperature by depth for simulated overwintering prepupae."
+     ),
+     "These empirical data are subset from temperature loggers that were placed at 10 (red), 20 (pink) and 30 cm (blue) below the soil surface in sandy soil (i.e. Walsingham silt loam) at our Ilderton (Ontario, Canada) field site from August 2015 to July 2016. Temperature distributions by month for these data are presented in Figure 2 of the main manuscript; summary statistics are presented in Table S2; see main manuscript for additional details."
+   )
+ ), 
+        tabPanel(
+          p(icon("chart-line"), "Acclimatization"), 
+    
+                    br(),
+           p(icon("info-circle", verify_fa = FALSE), "Use the panel to select acclimatization depth(s)."),
+            hr(),
+              plotOutput("tMR", height = "500px"),
+          br(),
+         p(strong(HTML("CO<sub>2</sub>"), "production-temperature relationships for simulated prepupae acclimatized at various burrowing depths (linetype) in October, November, January, and May."),
+                   "Lines are expected values from a generalized linear (mixed-effects) model with a log link and gamma distribution for a prepupa of average mass for each time point at a soil depth of 10 (red), 20 (pink) and 30 cm (blue). Expected values from newly-formed prepupae in October (baseline; empirical data are in Figure 4A of the main manuscript) are provided as reference in each plot (grey fitted line), and are used for all predictions from the start of dormancy to October in our simulation. Empirical data are presented in Figure 5 of the main manuscript; semilog plots are presented in Figure S6; statistics are presented in Table S3; see main manuscript for additional details.")
+        ),
+         tabPanel(
+          p(icon("battery-full"), "Lipid Use"), 
+           br(),
+           p(icon("info-circle", verify_fa = FALSE), "Use the panel to select burrowing and acclimitization depth(s), and  dormancy duration."
+        ),
+            hr(),
+          plotOutput("lipid_by_hour", height = "500px"),
+        br(),
+        p(strong("Lipid use by simulated overwintering prepupae."), "Hourly (A), cumulative (B), autumn (C), winter (D), and spring (E) lipid use was predicted from empirical microclimate data, and a generalized linear (mixed-effects) model with a log link and gamma distribution for prepupae of average mass (see previous panel) acclimatized to microclimates at 10 (solid line) or 30 cm (dotted line) and overwintered at burrowing depths of 10 (red lines) or 30 cm (blue lines). Dashed vertical lines in panels A and B represent the boundaries between seasons of autumn (1 September to 1 December), winter (1 December to 1 March), and spring (1 March to 1 June).")
+        ),
+        tabPanel(
+          p(icon("check-double"), "Validation"), 
+           br(),
+           p(icon("info-circle", verify_fa = FALSE), "Use the panel to select initial lipid content."),
+            hr(),
+          plotOutput("validation_plot", height = "500px"),
+             p(strong("Simulated (lines) and empirical (points) lipid use by overwintering prepupae (A), and the absolute error between simulated and empirical lipid use (B) at 10 (red) and 30 cm (blue) beneath the soil surface."),"Boxes are bounded by the first and third quartiles, internal bars indicate the median, and error bars denote 1.5 × the inter-quartile range. Numbers above points indicate sample sizes."),
+        verbatimTextOutput("ae_anova")
+          ),
+
+          
+          
+          
+          
+
+
+             
+      )
+
+    )
+  )
+)
+```
+
+
+
